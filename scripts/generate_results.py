@@ -27,6 +27,7 @@ import numpy as np
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from scipy.spatial.transform import Rotation
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 SRC = os.path.abspath(os.path.join(ROOT, "..", "src"))
@@ -61,7 +62,7 @@ def run_near_singular_demo():
         w_threshold=0.05, lam_max=0.05,
         joint_limits=iiwa7["joint_limits"], verbose=True,
     )
-    return log
+    return log, traj, iiwa7
 
 
 def write_csv(log, path):
@@ -149,22 +150,142 @@ def plot_chart_comparison(path):
     plt.close()
 
 
+def write_joint_csv(log, path):
+    n = log["q_history"].shape[1]
+    header = "t," + ",".join(f"q{i+1}" for i in range(n))
+    with open(path, "w") as f:
+        f.write(header + "\n")
+        for k in range(len(log["t_history"])):
+            row = ",".join(f"{log['q_history'][k, i]:.8f}" for i in range(n))
+            f.write(f"{log['t_history'][k]:.6f},{row}\n")
+
+
+def plot_joint_angles(log, joint_limits, path):
+    n = log["q_history"].shape[1]
+    t = log["t_history"]
+    fig, ax = plt.subplots(figsize=(8, 5))
+    colors = plt.cm.tab10(np.linspace(0, 1, n))
+    for i in range(n):
+        ax.plot(t, np.degrees(log["q_history"][:, i]), color=colors[i], label=f"q{i+1}")
+    ax.set_xlabel("time (s)")
+    ax.set_ylabel("joint angle (deg)")
+    ax.set_title("Joint angles q1..q7 over the run, iiwa7_r800")
+    ax.legend(ncol=4, fontsize=8, loc="upper center", bbox_to_anchor=(0.5, -0.12))
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    plt.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close()
+
+
+def compute_ee_pose_history(log, traj, S_list, M):
+    """
+    Recompute the desired pose g_des(t) (from the trajectory function -- it
+    is NOT stored by run_control_loop, only the pose-error twist is) and
+    the actual pose T_sb(q(t)) (via forward_kinematics on the logged joint
+    history) at every timestep, for direct position/orientation comparison.
+
+    Returns
+    -------
+    dict with keys:
+        actual_pos, desired_pos   : (num_steps+1, 3)
+        actual_R, desired_R       : (num_steps+1, 3, 3)
+    """
+    t_history = log["t_history"]
+    q_history = log["q_history"]
+    n_steps = len(t_history)
+
+    actual_pos = np.zeros((n_steps, 3))
+    desired_pos = np.zeros((n_steps, 3))
+    actual_R = np.zeros((n_steps, 3, 3))
+    desired_R = np.zeros((n_steps, 3, 3))
+
+    for k in range(n_steps):
+        T_actual = forward_kinematics(q_history[k], S_list, M)
+        actual_pos[k] = T_actual[:3, 3]
+        actual_R[k] = T_actual[:3, :3]
+
+        g_des, _ = traj(t_history[k])
+        g_des = np.asarray(g_des, dtype=float)
+        desired_pos[k] = g_des[:3, 3]
+        desired_R[k] = g_des[:3, :3]
+
+    return {
+        "actual_pos": actual_pos, "desired_pos": desired_pos,
+        "actual_R": actual_R, "desired_R": desired_R,
+    }
+
+
+def plot_position_tracking(t_history, pose_hist, path):
+    labels = ["x", "y", "z"]
+    fig, axes = plt.subplots(3, 1, figsize=(8, 7), sharex=True)
+    for i, label in enumerate(labels):
+        axes[i].plot(t_history, pose_hist["desired_pos"][:, i],
+                     "--", color="tab:gray", label="desired (g_des)", linewidth=1.5)
+        axes[i].plot(t_history, pose_hist["actual_pos"][:, i],
+                     "-", color="tab:blue", label="actual (FK of q(t))", linewidth=1.5)
+        axes[i].set_ylabel(f"{label} (m)")
+        axes[i].grid(True, alpha=0.3)
+    axes[0].legend(loc="best", fontsize=9)
+    axes[-1].set_xlabel("time (s)")
+    fig.suptitle("End-effector position: desired vs. actual (iiwa7_r800)")
+    fig.tight_layout()
+    plt.savefig(path, dpi=150)
+    plt.close()
+
+
+def plot_orientation_tracking(t_history, pose_hist, path):
+    # NOTE: Euler angles are used here ONLY for human-readable plotting.
+    # They are not part of the control law anywhere in this project (which
+    # uses the log map specifically to avoid fixed-chart representations)
+    # and they carry their own well-known singularity (gimbal lock) at
+    # pitch = +/-90 deg -- a different chart, a different singular locus,
+    # but a singular locus nonetheless. Don't read anything into an
+    # apparent jump here without checking it against xi_err_history first.
+    actual_euler = Rotation.from_matrix(pose_hist["actual_R"]).as_euler("xyz", degrees=True)
+    desired_euler = Rotation.from_matrix(pose_hist["desired_R"]).as_euler("xyz", degrees=True)
+
+    labels = ["roll (x)", "pitch (y)", "yaw (z)"]
+    fig, axes = plt.subplots(3, 1, figsize=(8, 7), sharex=True)
+    for i, label in enumerate(labels):
+        axes[i].plot(t_history, desired_euler[:, i],
+                     "--", color="tab:gray", label="desired (g_des)", linewidth=1.5)
+        axes[i].plot(t_history, actual_euler[:, i],
+                     "-", color="tab:red", label="actual (FK of q(t))", linewidth=1.5)
+        axes[i].set_ylabel(f"{label} (deg)")
+        axes[i].grid(True, alpha=0.3)
+    axes[0].legend(loc="best", fontsize=9)
+    axes[-1].set_xlabel("time (s)")
+    fig.suptitle("End-effector orientation (Euler xyz, viz-only): desired vs. actual")
+    fig.tight_layout()
+    plt.savefig(path, dpi=150)
+    plt.close()
+
+
+
 def main():
     os.makedirs(RESULTS_DIR, exist_ok=True)
-    log = run_near_singular_demo()
+    log, traj, iiwa7 = run_near_singular_demo()
 
     csv_path = os.path.join(RESULTS_DIR, "run_log.csv")
     json_path = os.path.join(RESULTS_DIR, "run_summary.json")
+    joint_csv_path = os.path.join(RESULTS_DIR, "joint_angles.csv")
     write_csv(log, csv_path)
     summary = write_summary(log, json_path)
+    write_joint_csv(log, joint_csv_path)
 
     plot_tracking_error(log, os.path.join(RESULTS_DIR, "tracking_error.png"))
     plot_manipulability_and_damping(log, os.path.join(RESULTS_DIR, "manipulability_and_damping.png"))
     plot_chart_comparison(os.path.join(RESULTS_DIR, "chart_comparison.png"))
+    plot_joint_angles(log, iiwa7["joint_limits"], os.path.join(RESULTS_DIR, "joint_angles.png"))
+
+    pose_hist = compute_ee_pose_history(log, traj, iiwa7["S_list"], iiwa7["M"])
+    plot_position_tracking(log["t_history"], pose_hist, os.path.join(RESULTS_DIR, "position_tracking.png"))
+    plot_orientation_tracking(log["t_history"], pose_hist, os.path.join(RESULTS_DIR, "orientation_tracking.png"))
 
     print("\nWrote:")
-    for fname in ["run_log.csv", "run_summary.json", "tracking_error.png",
-                  "manipulability_and_damping.png", "chart_comparison.png"]:
+    for fname in ["run_log.csv", "run_summary.json", "joint_angles.csv", "tracking_error.png",
+                  "manipulability_and_damping.png", "chart_comparison.png", "joint_angles.png",
+                  "position_tracking.png", "orientation_tracking.png"]:
         print(f"  results/{fname}")
     print("\nSummary:")
     print(json.dumps(summary, indent=2))
