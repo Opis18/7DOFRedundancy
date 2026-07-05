@@ -1,0 +1,8 @@
+{
+  "final_tracking_error_norm": 0.0001523726304100848,
+  "max_tracking_error_norm": 0.00911474473265185,
+  "mean_manipulability": 0.033652172575107754,
+  "min_manipulability": 0.00010982377083644456,
+  "max_damping_lambda": 0.04978059368353993,
+  "num_steps": 600
+}
